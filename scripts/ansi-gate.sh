@@ -43,7 +43,10 @@ set -u
 # eval-and-compile 313/5, iteration 835/8, streams 795/8, packages 491/9,
 # types-and-classes 613/10, structures 1380/14, reader 658/15,
 # objects 811/52, arrays 1243/113, printer 2288/158, system-construction 39/38.
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc)
+# environment added 2026-10-15: ok (210/210) once FUNCTION-KEYWORDS,
+# INITIALIZE-INSTANCE, NO-APPLICABLE-METHOD and NO-NEXT-METHOD had function
+# objects (documentation.function.t.12 walks every standard generic function).
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc environment)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"
