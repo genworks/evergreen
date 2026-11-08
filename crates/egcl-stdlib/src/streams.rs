@@ -4056,7 +4056,20 @@ pub fn stream_line_column(stream: EgclVal) -> Option<u64> {
     let Ok(stream) = resolve_synonym_stream(stream, false) else {
         return None;
     };
-    with_stream(stream, |guard| Ok(guard.stream_line_column())).unwrap_or(None)
+    // A broadcast stream is at its last component's column and a two-way or
+    // echo stream at its output's, as for FILE-POSITION, so FRESH-LINE and
+    // FORMAT's ~& see where output will land.
+    with_stream(stream, |guard| {
+        let comps = guard.components();
+        Ok(match guard.inner {
+            StreamInner::Broadcast => comps.last().and_then(|last| stream_line_column(*last)),
+            StreamInner::TwoWay | StreamInner::Echo { .. } => {
+                comps.get(1).and_then(|output| stream_line_column(*output))
+            }
+            _ => guard.stream_line_column(),
+        })
+    })
+    .unwrap_or(None)
 }
 
 // ── R5.113 additional Gray protocol free-function wrappers ────────
