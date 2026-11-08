@@ -7581,6 +7581,14 @@ fn resolve_class_metaobject(env: &Env, class: EgclVal) -> Result<EgclVal, EgclEr
     if let Some(found) = egcl_stdlib::find_class(class) {
         return Ok(found);
     }
+    // The restart machinery defines RESTART on first use; a specializer or
+    // any other class designator must see it before then, as FIND-CLASS does
+    // (GitHub #917).
+    if sym_bare_name_rc(class).as_ref() == "RESTART"
+        && symbol_home_package_name(class) == "COMMON-LISP"
+    {
+        return ensure_restart_class(env);
+    }
     let name = sym_name(class);
     if builtin_condition_definition(&name).is_some() {
         return ensure_condition_class_registered(env, &name);
