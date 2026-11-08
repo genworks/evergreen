@@ -644,12 +644,26 @@ fn lookup_custom_macro(readtable: EgclVal, ch: char) -> Option<(EgclVal, bool)> 
         .and_then(|table| table.get(&(key, ch)).copied())
 }
 
+/// Marks a standard `#` sub-character restored into a `#` dispatch table that
+/// MAKE-DISPATCH-MACRO-CHARACTER rebuilt: the built-in reader handles it, with
+/// the current readtable.
+const STANDARD_SUB_CHAR: EgclVal = egcl_rt::value::UNBOUND;
+
 fn lookup_custom_dispatch(readtable: EgclVal, disp_char: char, sub_char: char) -> Option<EgclVal> {
     let key = readtable_key(readtable);
     let guard = DISPATCH_SUB_CHARS.lock().unwrap();
     guard
         .as_ref()
         .and_then(|table| table.get(&(key, disp_char, sub_char)).copied())
+        .filter(|&handler| handler != STANDARD_SUB_CHAR)
+}
+
+fn standard_sub_char_restored(readtable: EgclVal, sub_char: char) -> bool {
+    let key = readtable_key(readtable);
+    let guard = DISPATCH_SUB_CHARS.lock().unwrap();
+    guard.as_ref().is_some_and(|table| {
+        table.get(&(key, '#', sub_char.to_ascii_uppercase())) == Some(&STANDARD_SUB_CHAR)
+    })
 }
 
 fn dispatch_is_registered(readtable: EgclVal, ch: char) -> bool {
@@ -1880,6 +1894,18 @@ fn read_custom_dispatch_char(
     }
     let sub = chars.at(p)?;
     p += 1;
+    if disp == '#' && standard_sub_char_restored(rt, sub) {
+        // The built-in reader parses the infix argument again itself.
+        return read_sharpsign_with_base(
+            chars,
+            pos + 1,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        );
+    }
     match lookup_custom_dispatch(rt, disp, sub.to_ascii_uppercase()) {
         Some(handler) if handler != T => {
             let disp_invoker = *MACRO_INVOKER.lock().unwrap();
@@ -5079,10 +5105,18 @@ pub fn set_standard_macro_alias(readtable: EgclVal, to: char, source: char, non_
 /// applies again. The dispatch-table counterpart of
 /// [`set_standard_macro_syntax`].
 pub fn set_standard_dispatch_macro_character(readtable: EgclVal, disp_char: char, sub_char: char) {
+    // A `#` that MAKE-DISPATCH-MACRO-CHARACTER rebuilt reads through its own
+    // table, so the restored sub-character needs an entry there (GitHub #940).
+    let rebuilt = dispatch_is_registered(readtable, disp_char);
     let key = readtable_key(readtable);
     let mut guard = DISPATCH_SUB_CHARS.lock().unwrap();
-    if let Some(table) = guard.as_mut() {
-        table.remove(&(key, disp_char, sub_char.to_ascii_uppercase()));
+    let entry = (key, disp_char, sub_char.to_ascii_uppercase());
+    if rebuilt {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(entry, STANDARD_SUB_CHAR);
+    } else if let Some(table) = guard.as_mut() {
+        table.remove(&entry);
     }
 }
 
@@ -5126,7 +5160,9 @@ pub fn get_dispatch_macro_character(
     let guard = DISPATCH_SUB_CHARS.lock().unwrap();
     if let Some(table) = guard.as_ref() {
         // Symmetric with set_dispatch_macro_character's CLHS upcasing.
-        if let Some(&func) = table.get(&(key, disp_char, sub_char.to_ascii_uppercase())) {
+        if let Some(&func) = table.get(&(key, disp_char, sub_char.to_ascii_uppercase()))
+            && func != STANDARD_SUB_CHAR
+        {
             return Ok(Some(func));
         }
     }
@@ -5209,7 +5245,9 @@ pub fn readtable_macro_character_candidates(readtable: EgclVal) -> Vec<MacroChar
 /// Whether `ch` is a dispatch macro character in `readtable` (built-in `#`, or
 /// one made via `make-dispatch-macro-character`).
 pub fn is_dispatch_macro_character(readtable: EgclVal, ch: char) -> bool {
-    ch == '#' || dispatch_is_registered(readtable, ch)
+    // `#` stops being one once SET-SYNTAX-FROM-CHAR gives it other syntax.
+    dispatch_is_registered(readtable, ch)
+        || (ch == '#' && standard_macro_source(readtable, '#') == Some(('#', true)))
 }
 
 pub fn make_dispatch_macro_character(
