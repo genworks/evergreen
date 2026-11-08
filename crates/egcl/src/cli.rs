@@ -48188,6 +48188,7 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
         "OVERWRITE" => egcl_stdlib::streams::IF_EXISTS_OVERWRITE_VAL,
         "ERROR" => egcl_stdlib::streams::IF_EXISTS_ERROR_VAL,
         "SUPERSEDE" => egcl_stdlib::streams::IF_EXISTS_SUPERSEDE_VAL,
+        "RENAME" => egcl_stdlib::streams::IF_EXISTS_RENAME_VAL,
         _ => if_exists,
     };
 
@@ -48301,8 +48302,14 @@ fn eval_with_open_file(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError
     });
     egcl_rt::rooted_ref!(_result_root = &mut result);
     // `:if-does-not-exist nil` yields a NIL "stream"; there is nothing to close.
+    // Leaving the body abnormally aborts the file (CLHS WITH-OPEN-FILE), and
+    // the body's own error outranks any from that close.
     if !stream_val.is_nil() {
-        egcl_stdlib::close(stream_val, false)?;
+        let aborting = result.is_err();
+        let closed = egcl_stdlib::close(stream_val, aborting);
+        if !aborting {
+            closed?;
+        }
     }
     drop(_result_root);
     result

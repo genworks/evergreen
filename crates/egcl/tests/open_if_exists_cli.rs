@@ -111,3 +111,85 @@ fn evaluated_if_exists_modes_preserve_file_contents_across_tiers() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("OPEN-MODES-PASS"));
     }
 }
+
+/// CLHS CLOSE: an aborted output stream deletes the file it created and does
+/// not supersede the file it replaced; WITH-OPEN-FILE aborts on a non-local
+/// exit. Quicklisp's local-projects index rebuild relies on this.
+#[test]
+fn close_abort_deletes_new_files_and_keeps_replaced_ones_across_tiers() {
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let root =
+            std::env::temp_dir().join(format!("egcl-close-abort-{}-{tier}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let program = r#"
+          (defun write-file (path text)
+            (with-open-file (s path :direction :output :if-exists :supersede)
+              (write-string text s)))
+          (defun contents (path)
+            (if (probe-file path)
+                (with-open-file (s path) (or (read-line s nil) :empty))
+                :no-file))
+          (defun aborted-write (path direction if-exists)
+            (let ((s (if if-exists
+                         (open path :direction direction :if-exists if-exists)
+                         (open path :direction direction))))
+              (write-string "new" s)
+              (finish-output s)
+              (close s :abort t)))
+          (dolist (direction '(:output :io))
+            (aborted-write "fresh.txt" direction nil)
+            (assert (eq :no-file (contents "fresh.txt")))
+            (dolist (mode '(:supersede :rename :rename-and-delete :new-version))
+              (write-file "old.txt" "old")
+              (aborted-write "old.txt" direction mode)
+              (assert (equal "old" (contents "old.txt")))
+              (assert (eq :no-file (contents "old.txt.bak")))))
+          (write-file "unwound.txt" "old")
+          (ignore-errors
+            (with-open-file (s "unwound.txt" :direction :output :if-exists :supersede)
+              (write-string "new" s)
+              (error "unwind")))
+          (assert (equal "old" (contents "unwound.txt")))
+          (ignore-errors
+            (with-open-file (s "unwound-new.txt" :direction :output)
+              (write-string "new" s)
+              (error "unwind")))
+          (assert (eq :no-file (contents "unwound-new.txt")))
+          (write-file "kept.txt" "old")
+          (with-open-file (s "kept.txt" :direction :output :if-exists :rename)
+            (write-string "new" s))
+          (assert (equal "new" (contents "kept.txt")))
+          (assert (equal "old" (contents "kept.txt.bak")))
+          (dolist (mode '(:supersede :rename-and-delete :new-version))
+            (write-file "replaced.txt" "old")
+            (with-open-file (s "replaced.txt" :direction :output :if-exists mode)
+              (write-string "new" s))
+            (assert (equal "new" (contents "replaced.txt")))
+            (assert (eq :no-file (contents "replaced.txt.bak"))))
+          (write-line "CLOSE-ABORT-PASS")
+        "#;
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .current_dir(&root)
+            .args(["--no-init", "--eval", program])
+            .env("EGCL_FORCE_TIER", tier)
+            .env_remove("EGCL_BACKEND")
+            .env_remove("EGCL_DISABLE_T2")
+            .output()
+            .expect("run CLOSE :ABORT checks");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("CLOSE-ABORT-PASS"),
+            "{tier}: {stdout}\n{stderr}"
+        );
+        assert!(leftovers.is_empty(), "{tier}: set-aside files left: {leftovers:?}");
+    }
+}

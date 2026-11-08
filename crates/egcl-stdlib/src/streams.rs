@@ -258,6 +258,8 @@ pub const IF_EXISTS_ERROR_VAL: EgclVal = EgclVal(1 << 3); // fixnum 1
 pub const IF_EXISTS_SUPERSEDE_VAL: EgclVal = EgclVal(2 << 3); // fixnum 2
 pub const IF_EXISTS_APPEND_VAL: EgclVal = EgclVal(3 << 3); // fixnum 3
 pub const IF_EXISTS_OVERWRITE_VAL: EgclVal = EgclVal(4 << 3); // fixnum 4
+/// :RENAME keeps the file it replaces, as NAME.bak beside it.
+pub const IF_EXISTS_RENAME_VAL: EgclVal = EgclVal(6 << 3); // fixnum 6
 
 /// Missing-file creation policy; NIL returns NIL and T signals a file error.
 pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
@@ -313,6 +315,10 @@ struct StreamMutableState {
     open: bool,
     element_type: StreamElementType,
     inner: StreamInner,
+    /// What CLOSE owes the file system for a file this stream created or
+    /// replaced; settled by CLOSE, or as a normal close if the stream is
+    /// dropped unclosed.
+    replacement: Option<FileReplacement>,
     /// Raw pointer to the sibling `StreamAlloc::components` slice, so composite
     /// op arms can read their component references without re-entering
     /// `get_stream_alloc`. Points into the same (stable, off-heap) `Box`, so it
@@ -2784,6 +2790,7 @@ fn alloc_stream(
                 open: true,
                 element_type,
                 inner,
+                replacement: None,
                 components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<EgclVal>(), 0),
             },
         ),
@@ -3127,6 +3134,162 @@ fn missing_file_policy(if_does_not_exist: EgclVal, path_str: &str) -> Result<(),
     )))
 }
 
+/// A file an output stream created, or put in place of an existing one.
+/// CLHS CLOSE: with :ABORT T, "if stream performs output to a file that was
+/// created when the stream was created, the file is deleted and any
+/// previously existing file is not superseded".
+struct FileReplacement {
+    target: std::path::PathBuf,
+    /// Where OPEN moved the file it replaced, if it replaced one.
+    original: Option<std::path::PathBuf>,
+    /// :IF-EXISTS :RENAME keeps the original under its new name.
+    keep_original: bool,
+    settled: bool,
+}
+
+impl FileReplacement {
+    fn created(target: std::path::PathBuf) -> Self {
+        FileReplacement {
+            target,
+            original: None,
+            keep_original: false,
+            settled: false,
+        }
+    }
+
+    /// A normal close: the new file stands, and the one it replaced goes
+    /// unless :RENAME asked to keep it.
+    fn commit(&mut self) {
+        self.settled = true;
+        if let Some(original) = &self.original
+            && !self.keep_original
+        {
+            let _ = std::fs::remove_file(original);
+        }
+    }
+
+    /// CLOSE :ABORT T: delete the new file and put back the one it replaced.
+    fn abort(&mut self) -> Result<(), EgclError> {
+        self.settled = true;
+        match std::fs::remove_file(&self.target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(EgclError::FileError(format!(
+                    "cannot delete aborted file {}: {}",
+                    self.target.display(),
+                    e
+                )));
+            }
+        }
+        if let Some(original) = &self.original {
+            std::fs::rename(original, &self.target).map_err(|e| {
+                EgclError::FileError(format!(
+                    "cannot restore {} from {}: {}",
+                    self.target.display(),
+                    original.display(),
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FileReplacement {
+    /// A stream collected without CLOSE counts as closed normally.
+    fn drop(&mut self) {
+        if !self.settled {
+            self.commit();
+        }
+    }
+}
+
+/// Open a fresh file in place of the existing PATH, for :SUPERSEDE, :RENAME,
+/// :RENAME-AND-DELETE and :NEW-VERSION. The existing file is moved aside, not
+/// truncated, so CLOSE :ABORT T can put it back. When the directory refuses
+/// the move, :RENAME fails and the others fall back to truncating in place,
+/// which an abort cannot undo.
+fn replace_existing_file(
+    path: &std::path::Path,
+    if_exists: EgclVal,
+    io: bool,
+) -> Result<(std::fs::File, Option<FileReplacement>), EgclError> {
+    static NEXT_ASIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let open_fresh = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .read(io)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))
+    };
+    let keep_original = if_exists == IF_EXISTS_RENAME_VAL;
+    // Replace what a symbolic link names, not the link.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = if keep_original {
+        target.with_file_name(format!("{}.bak", name))
+    } else {
+        target.with_file_name(format!(
+            ".{}.egcl-{}-{}",
+            name,
+            std::process::id(),
+            NEXT_ASIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    };
+    let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    if let Err(e) = std::fs::rename(&target, &aside) {
+        if keep_original {
+            return Err(EgclError::FileError(format!(
+                "cannot rename {} to {}: {}",
+                target.display(),
+                aside.display(),
+                e
+            )));
+        }
+        return Ok((open_fresh(&target)?, None));
+    }
+    match open_fresh(&target) {
+        Ok(file) => {
+            if let Some(permissions) = permissions {
+                let _ = file.set_permissions(permissions);
+            }
+            Ok((
+                file,
+                Some(FileReplacement {
+                    target,
+                    original: Some(aside),
+                    keep_original,
+                    settled: false,
+                }),
+            ))
+        }
+        Err(e) => {
+            let _ = std::fs::rename(&aside, &target);
+            Err(e)
+        }
+    }
+}
+
+/// Hand a new file stream the plan CLOSE settles.
+fn set_replacement(
+    stream: EgclVal,
+    replacement: Option<FileReplacement>,
+) -> Result<(), EgclError> {
+    if replacement.is_none() {
+        return Ok(());
+    }
+    with_stream(stream, move |state| {
+        state.replacement = replacement;
+        Ok(())
+    })
+}
+
 pub fn open(
     pathname: EgclVal,
     direction: StreamDirection,
@@ -3274,6 +3437,7 @@ fn open_file(
         }
         StreamDirection::Output => {
             // Issue #8: Handle if_exists variants including :append.
+            let mut replacement = None;
             let file = if path.exists() {
                 if if_exists == NIL {
                     return Ok(NIL);
@@ -3299,32 +3463,41 @@ fn open_file(
                         path_str
                     )));
                 } else {
-                    // Default (:supersede / T / any other value) — truncate and create
-                    std::fs::File::create(path)
-                        .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                    // Default (:supersede / T / :rename / :rename-and-delete /
+                    // :new-version) — a fresh file in place of the old one
+                    let (file, plan) = replace_existing_file(path, if_exists, false)?;
+                    replacement = plan;
+                    file
                 }
             } else {
                 if if_does_not_exist == NIL {
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                std::fs::File::create(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                let file = std::fs::File::create(path)
+                    .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?;
+                replacement = Some(FileReplacement::created(path.to_path_buf()));
+                file
             };
-            Ok(alloc_stream(
-                elt,
-                StreamInner::FileOutput {
-                    file: StreamHandle::File(file),
-                    write_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                    external_format,
-                    line: 0,
-                    col: 0,
-                },
-                vec![],
-                Some(absolute_path),
-            ))
+            egcl_rt::rooted!(
+                stream = alloc_stream(
+                    elt,
+                    StreamInner::FileOutput {
+                        file: StreamHandle::File(file),
+                        write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                        external_format,
+                        line: 0,
+                        col: 0,
+                    },
+                    vec![],
+                    Some(absolute_path),
+                )
+            );
+            set_replacement(*stream, replacement)?;
+            Ok(*stream)
         }
         StreamDirection::Io => {
+            let mut replacement = None;
             let file = if path.exists() {
                 if if_exists == NIL {
                     return Ok(NIL);
@@ -3350,43 +3523,47 @@ fn open_file(
                         .open(path)
                         .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
                 } else {
-                    // Default (:supersede / T) — truncate
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(path)
-                        .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
+                    // Default (:supersede / T / :rename / :rename-and-delete /
+                    // :new-version) — a fresh file in place of the old one
+                    let (file, plan) = replace_existing_file(path, if_exists, true)?;
+                    replacement = plan;
+                    file
                 }
             } else {
                 if if_does_not_exist == NIL {
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                std::fs::OpenOptions::new()
+                let file = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .open(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
+                    .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?;
+                replacement = Some(FileReplacement::created(path.to_path_buf()));
+                file
             };
-            Ok(alloc_stream(
-                elt,
-                StreamInner::FileIo {
-                    file: StreamHandle::File(file),
-                    read_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                    buf_pos: 0,
-                    buf_fill: 0,
-                    write_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                    line: 0,
-                    col: 0,
-                    unread: None,
-                    external_format,
-                },
-                vec![],
-                Some(absolute_path),
-            ))
+            egcl_rt::rooted!(
+                stream = alloc_stream(
+                    elt,
+                    StreamInner::FileIo {
+                        file: StreamHandle::File(file),
+                        read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                        buf_pos: 0,
+                        buf_fill: 0,
+                        write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                        line: 0,
+                        col: 0,
+                        unread: None,
+                        external_format,
+                    },
+                    vec![],
+                    Some(absolute_path),
+                )
+            );
+            set_replacement(*stream, replacement)?;
+            Ok(*stream)
         }
     }
 }
@@ -3414,6 +3591,14 @@ pub fn close(stream: EgclVal, abort: bool) -> Result<(), EgclError> {
             _ => {}
         }
         guard.open = false;
+        // Settle the file only once the handle is closed.
+        if let Some(mut replacement) = guard.replacement.take() {
+            if abort {
+                replacement.abort()?;
+            } else {
+                replacement.commit();
+            }
+        }
         Ok(())
     })
 }
