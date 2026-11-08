@@ -5168,8 +5168,14 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                 } else {
                     1
                 };
-                // Fresh line: emit newline only if not at start of line
-                if !output.is_empty() && !output.ends_with('\n') {
+                // Fresh line: emit newline only if not at start of line.  Before
+                // any output, that is the destination stream's own column.
+                let at_line_start = if output.is_empty() {
+                    output.start_column == 0
+                } else {
+                    output.ends_with('\n')
+                };
+                if !at_line_start {
                     output.character('\n');
                 }
                 for _ in 1..count {
